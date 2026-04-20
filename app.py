@@ -4,37 +4,45 @@ import pdfplumber
 import re
 from datetime import datetime
 
-# 页面配置：极简 B 端风格
-st.set_page_config(page_title="发票对账管理系统", layout="wide")
+# 页面配置
+st.set_page_config(page_title="发票管理助手", layout="wide", initial_sidebar_state="expanded")
 
-# --- 核心解析逻辑 ---
-def extract_invoice_info(file):
+# --- 增强版解析函数 ---
+def parse_invoice_pdf(file):
     with pdfplumber.open(file) as pdf:
         full_text = ""
         for page in pdf.pages:
-            full_text += page.extract_text()
+            content = page.extract_text()
+            if content:
+                full_text += content
         
         try:
-            # 1. 提取金额（价税合计小写）
-            amount_match = re.search(r"（小写）¥?([\d\.]+)", full_text)
-            amount = float(amount_match.group(1)) if amount_match else 0.0
+            # 1. 提取金额
+            amt_match = re.search(r"（小写）¥?\s*([\d\.]+)", full_text)
+            amount = float(amt_match.group(1)) if amt_match else 0.0
             
             # 2. 提取日期
-            date_match = re.search(r"开票日期:(\d{4})年(\d{2})月(\d{2})日", full_text)
-            inv_date = datetime(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))) if date_match else datetime.now()
+            date_match = re.search(r"日期\s*:\s*(\d{4})年(\d{2})月(\d{2})日", full_text)
+            inv_date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}" if date_match else "未知日期"
 
-            # 3. 提取销方与购方 (通过关键词匹配)
-            # 逻辑：通常发票左侧为购买方，右侧为销售方
-            names = re.findall(r"名称\s*:\s*([^\n\s]+)", full_text)
-            buyer = names[0] if len(names) > 0 else "未知购方"
-            seller = names[1] if len(names) > 1 else "未知销方"
+            # 3. 提取销方与购方 (改进版：根据纳税人识别号位置定位)
+            lines = full_text.split('\n')
+            buyer, seller = "未知购方", "未知销方"
+            
+            # 寻找包含“名称”的行
+            name_lines = [l for l in lines if "名称" in l]
+            if len(name_lines) >= 2:
+                # 第一行通常是购方，第二行通常是销方
+                buyer = name_lines[0].split(":")[-1].split("：")[-1].strip()
+                seller = name_lines[1].split(":")[-1].split("：")[-1].strip()
 
-            # 4. 提取项目名称 (针对您备注栏的特定格式)
+            # 4. 提取项目名称 (优先匹配备注栏)
             project = "未命名项目"
-            if "项目名称:" in full_text:
-                project = full_text.split("项目名称:")[1].split("\n")[0].strip()
-            elif "项目名称：" in full_text:
-                project = full_text.split("项目名称：")[1].split("\n")[0].strip()
+            if "项目名称" in full_text:
+                # 截取项目名称字样后的内容直到换行
+                p_match = re.search(r"项目名称[:：]\s*([^\n]+)", full_text)
+                if p_match:
+                    project = p_match.group(1).split("项目地址")[0].strip() # 剔除后面可能连带的地址
 
             return {
                 "销方": seller,
@@ -42,91 +50,107 @@ def extract_invoice_info(file):
                 "项目": project,
                 "日期": inv_date,
                 "金额": amount,
-                "已收": 0.0
+                "已收": 0.0,
+                "文件名": file.name
             }
         except Exception as e:
-            st.error(f"解析出错，请检查PDF格式: {e}")
             return None
 
-# --- 数据持久化 (Session State) ---
-if 'db' not in st.session_state:
-    st.session_state.db = []
+# --- 数据管理 ---
+if 'invoice_db' not in st.session_state:
+    st.session_state.invoice_db = []
 
-# --- 界面布局 ---
-st.sidebar.title("🛠️ 管理面板")
-
-# 上传模块
-uploaded_pdf = st.sidebar.file_uploader("上传发票 (PDF)", type="pdf")
-if uploaded_pdf:
-    if st.sidebar.button("确认录入数据"):
-        data = extract_invoice_info(uploaded_pdf)
-        if data:
-            st.session_state.db.append(data)
-            st.sidebar.success("已识别并录入！")
-
-# 目录切换
-if st.session_state.db:
-    sellers = list(set(d["销方"] for d in st.session_state.db))
-    current_seller = st.sidebar.radio("选择管理主体（销方）", sellers)
-else:
-    current_seller = None
-    st.info("💡 请先在左侧上传 PDF 发票以开始。")
-
-# --- 主展示区 ---
-if current_seller:
-    st.title(f"🏢 {current_seller} - 对账台账")
+# --- 侧边栏：上传与文件夹切换 ---
+with st.sidebar:
+    st.title("📂 发票归档中心")
     
-    # 过滤数据
-    df_all = pd.DataFrame(st.session_state.db)
-    df_seller = df_all[df_all["销方"] == current_seller]
+    # 批量上传
+    uploaded_files = st.file_uploader("批量上传发票 (PDF)", type="pdf", accept_multiple_files=True)
+    if uploaded_files:
+        if st.button("🚀 批量识别并归类"):
+            count = 0
+            for f in uploaded_files:
+                # 检查是否已存在，避免重复录入
+                if not any(d.get('文件名') == f.name for d in st.session_state.invoice_db):
+                    res = parse_invoice_pdf(f)
+                    if res:
+                        st.session_state.invoice_db.append(res)
+                        count += 1
+            st.success(f"成功识别并归类 {count} 张发票！")
+
+    st.divider()
     
-    # 按购方分组显示
-    for buyer in df_seller["购方"].unique():
-        with st.expander(f"🤝 客户：{buyer}", expanded=True):
-            sub_df = df_seller[df_seller["购方"] == buyer]
+    # 文件夹式导航
+    if st.session_state.invoice_db:
+        all_sellers = sorted(list(set(d["销方"] for d in st.session_state.invoice_db)))
+        st.subheader("📁 销方文件夹")
+        selected_folder = st.radio("选择查看的主体", all_sellers)
+    else:
+        selected_folder = None
+        st.info("待录入...")
+
+# --- 主界面：文件夹内容展示 ---
+if selected_folder:
+    st.title(f"📂 销方：{selected_folder}")
+    
+    # 筛选当前销方的数据
+    current_data = [d for d in st.session_state.invoice_db if d["销方"] == selected_folder]
+    
+    # 按购方进行二级归类
+    buyers_in_folder = sorted(list(set(d["购方"] for d in current_data)))
+    
+    for buyer in buyers_in_folder:
+        with st.expander(f"🏢 购方：{buyer}", expanded=True):
+            # 找出该销方下、该购方的所有发票
+            invoices = [d for d in current_data if d["购方"] == buyer]
             
-            # 统计
-            total_amt = sub_df["金额"].sum()
-            total_paid = sub_df["已收"].sum()
-            balance = total_amt - total_paid
+            # 购方汇总统计
+            total_amt = sum(inv["金额"] for inv in invoices)
+            total_paid = sum(inv["已收"] for inv in invoices)
+            total_bal = total_amt - total_paid
             
-            m1, m2, m3 = st.columns(3)
-            m1.metric("累计金额", f"¥{total_amt:,.2f}")
-            m2.metric("已收金额", f"¥{total_paid:,.2f}")
-            m3.metric("剩余未收", f"¥{balance:,.2f}", delta=-balance if balance > 0 else "已清", delta_color="inverse")
+            col_m1, col_m2, col_m3 = st.columns(3)
+            col_m1.metric("累计应收", f"¥{total_amt:,.2f}")
+            col_m2.metric("已收合计", f"¥{total_paid:,.2f}")
+            col_m3.metric("待收余额", f"¥{total_bal:,.2f}", delta=-total_bal if total_bal > 0 else "已清结")
             
-            st.markdown("---")
+            st.divider()
             
-            # 项目详情行
-            for idx, row in sub_df.iterrows():
-                cols = st.columns([3, 2, 2, 1])
-                with cols[0]:
-                    st.write(f"**项目：**{row['项目']}")
-                    st.caption(f"开票日期: {row['日期'].strftime('%Y-%m-%d')}")
+            # 发票明细（项目级）
+            for inv in invoices:
+                # 在全局数据库中找到这个 inv 的索引，以便修改
+                idx = st.session_state.invoice_db.index(inv)
                 
-                with cols[1]:
-                    # 核销输入
-                    new_paid = st.number_input(f"实际到账 (总¥{row['金额']:,.2f})", 
-                                             value=row["已收"], 
-                                             key=f"pay_{idx}")
-                    # 同步到内存
-                    st.session_state.db[idx]["已收"] = new_paid
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                with c1:
+                    st.markdown(f"**项目：{inv['项目']}**")
+                    st.caption(f"📅 {inv['日期']} | 📄 {inv['文件名']}")
                 
-                row_balance = row["金额"] - new_paid
-                with cols[2]:
-                    if row_balance <= 0:
-                        st.markdown("<h3 style='color:green; margin:0;'>✅ 结清</h3>", unsafe_allow_html=True)
+                with c2:
+                    val = st.number_input(f"录入到账 (总¥{inv['金额']:,.2f})", 
+                                          value=inv["已收"], 
+                                          key=f"val_{idx}",
+                                          step=100.0)
+                    st.session_state.invoice_db[idx]["已收"] = val
+                
+                bal = inv["金额"] - val
+                with c3:
+                    if bal <= 0:
+                        st.markdown("<h3 style='color:#28a745; margin:0;'>✅ 结清</h3>", unsafe_allow_html=True)
                     else:
-                        st.markdown(f"待收: <b style='color:orange;'>¥{row_balance:,.2f}</b>", unsafe_allow_html=True)
+                        st.markdown(f"<p style='color:#ffc107; margin:0;'>待支付：<b>¥{bal:,.2f}</b></p>", unsafe_allow_html=True)
                 
-                with cols[3]:
+                with c4:
                     if st.button("删除", key=f"del_{idx}"):
-                        st.session_state.db.pop(idx)
+                        st.session_state.invoice_db.pop(idx)
                         st.rerun()
+                st.write("") # 增加行间距
 
-# 导出功能
-if st.sidebar.button("📥 导出全部台账"):
-    if st.session_state.db:
-        export_df = pd.DataFrame(st.session_state.db)
-        csv = export_df.to_csv(index=False).encode('utf-8-sig')
-        st.sidebar.download_button("点击下载 CSV", data=csv, file_name="invoice_summary.csv", mime="text/csv")
+else:
+    # 空白状态提示
+    st.markdown("""
+    ### 👋 欢迎使用极简发票对账系统
+    1. 请在左侧上传一份或多份 **PDF 电子发票**。
+    2. 点击 **“批量识别并归类”**。
+    3. 系统会自动根据销方（如毅兴、旭达）创建文件夹。
+    """)
