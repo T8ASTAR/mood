@@ -5,11 +5,11 @@ import re
 import os
 from datetime import datetime
 
-# 1. 页面配置与持久化文件定义
+# 1. 页面配置与持久化
 st.set_page_config(page_title="发票对账管理台账", layout="wide")
-DB_FILE = "invoice_ledger_v2.csv" # 持久化数据库文件
+DB_FILE = "invoice_ledger_v3.csv"
 
-# 自定义样式：区分“新增”与“老数据”
+# 自定义样式
 st.markdown("""
     <style>
     .stMetric { background-color: #fcfcfc; padding: 15px; border-radius: 12px; border: 1px solid #f0f0f0; }
@@ -17,35 +17,47 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 2. 数据库读取与保存逻辑
+# 2. 数据库逻辑
 def load_data():
     if os.path.exists(DB_FILE):
         try:
             df = pd.read_csv(DB_FILE)
+            # 确保日期格式统一，方便排序
             return df.to_dict('records')
         except: return []
     return []
 
 def save_data(data):
     if data:
-        pd.DataFrame(data).to_csv(DB_FILE, index=False, encoding='utf-8-sig')
+        # 保存前进行全局日期排序（降序：最新的在最前面）
+        df = pd.DataFrame(data)
+        df = df.sort_values(by="日期", ascending=False)
+        df.to_csv(DB_FILE, index=False, encoding='utf-8-sig')
+        return df.to_dict('records')
+    return []
 
-# 3. 核心解析引擎（兼容：项目名称/工程名称）
+# 3. 增强型解析引擎
 def parse_pdf(file):
     with pdfplumber.open(file) as pdf:
+        # 合并所有页面的文本，并去除多余空格
         text = "".join([p.extract_text() or "" for p in pdf.pages])
+        
         try:
-            # 金额与日期
-            amt = float(re.search(r"（小写）¥?\s*([\d\.]+)", text).group(1))
-            dt_match = re.search(r"日期\s*[:：]\s*(\d{4})年(\d{2})月(\d{2})日", text)
-            dt = f"{dt_match.group(1)}-{dt_match.group(2)}-{dt_match.group(3)}" if dt_match else "未知日期"
+            # 提取金额
+            amt_m = re.search(r"（小写）¥?\s*([\d\.]+)", text)
+            amt = float(amt_m.group(1)) if amt_m else 0.0
             
-            # 销方与购方定位
-            lines = [l.strip() for l in text.split('\n') if "名称" in l]
-            buyer = lines[0].split(":")[-1].split("：")[-1].strip() if len(lines) > 0 else "未知购方"
-            seller = lines[1].split(":")[-1].split("：")[-1].strip() if len(lines) > 1 else "未知销方"
+            # 提取日期 (识别: 2026年02月05日)
+            dt_m = re.search(r"(\d{4})年(\d{2})月(\d{2})日", text)
+            dt = f"{dt_m.group(1)}-{dt_m.group(2)}-{dt_m.group(3)}" if dt_m else "9999-12-31"
             
-            # 兼容“项目名称”或“工程名称”
+            # 增强版：提取购方与销方名称
+            # 寻找所有紧跟在“名称：”后的文本
+            names = re.findall(r"名称\s*[:：]\s*([^\n\s]+)", text)
+            buyer = names[0] if len(names) > 0 else "未知购方"
+            seller = names[1] if len(names) > 1 else "未知销方"
+            
+            # 提取项目名称/工程名称
             project = "未命名项目"
             for kw in ["项目名称", "工程名称", "项目", "工程"]:
                 p_match = re.search(f"{kw}[:：]\s*([^\n]+)", text)
@@ -63,89 +75,81 @@ if 'db' not in st.session_state:
 if 'new_batch' not in st.session_state:
     st.session_state.new_batch = []
 
-# 5. 侧边栏：精准查重上传
+# 5. 侧边栏
 with st.sidebar:
-    st.title("📂 归档中心")
+    st.title("📂 发票管理中心")
     uploaded_files = st.file_uploader("批量上传 PDF", type="pdf", accept_multiple_files=True)
     
-    if uploaded_files and st.button("🚀 开始解析并归类"):
-        batch_added = []
+    if uploaded_files and st.button("🚀 录入并自动排序"):
+        batch = []
         dups = 0
         for f in uploaded_files:
-            temp_res = parse_pdf(f)
-            if temp_res:
-                # 【核心逻辑：局部查重】
-                # 只有当 同一个销方(文件夹) 下 已经存在该文件名，才视为重复
-                is_dup = any(d['文件名'] == temp_res['文件名'] and d['销方'] == temp_res['销方'] for d in st.session_state.db)
-                
+            res = parse_pdf(f)
+            if res:
+                # 局部查重：同销方下不允许同名文件
+                is_dup = any(d['文件名'] == res['文件名'] and d['销方'] == res['销方'] for d in st.session_state.db)
                 if not is_dup:
-                    st.session_state.db.append(temp_res)
-                    batch_added.append(f.name)
-                else:
-                    dups += 1
+                    st.session_state.db.append(res)
+                    batch.append(f.name)
+                else: dups += 1
         
-        st.session_state.new_batch = batch_added
-        save_data(st.session_state.db)
-        if batch_added: st.success(f"新增 {len(batch_added)} 张发票")
-        if dups: st.warning(f"跳过当前文件夹已存在的重复件: {dups} 张")
+        st.session_state.new_batch = batch
+        # 存入文件时会自动执行日期排序
+        st.session_state.db = save_data(st.session_state.db)
+        if batch: st.success(f"成功录入 {len(batch)} 张")
+        if dups: st.warning(f"跳过 {dups} 张已存在文件")
 
-    st.divider()
-    # 文件夹式切换
     if st.session_state.db:
         sellers = sorted(list(set(d["销方"] for d in st.session_state.db)))
-        selected_seller = st.radio("📁 销方目录 (文件夹)", sellers)
-    else:
-        selected_seller = None
+        selected_seller = st.radio("📁 选择销方文件夹", sellers)
+    else: selected_seller = None
 
-# 6. 主界面展示
+# 6. 主界面
 if selected_seller:
-    st.title(f"📁 文件夹：{selected_seller}")
-    # 筛选当前销方
+    st.title(f"🏢 {selected_seller}")
+    # 筛选并确保当前显示的数据也是按日期排序的
     current_list = [d for d in st.session_state.db if d["销方"] == selected_seller]
+    current_list.sort(key=lambda x: x['日期'], reverse=True) # 倒序排列：新票在前
     
-    # 按购方分组
     for buyer in sorted(list(set(d["购方"] for d in current_list))):
         with st.expander(f"🤝 客户：{buyer}", expanded=True):
             invoices = [d for d in current_list if d["购方"] == buyer]
             
-            # 客户汇总统计
+            # 统计汇总
             t_amt = sum(i["金额"] for i in invoices)
             t_paid = sum(i["已收"] for i in invoices)
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("累计应收", f"¥{t_amt:,.2f}")
-            m2.metric("已到账", f"¥{t_paid:,.2f}")
-            m3.metric("余款", f"¥{t_amt - t_paid:,.2f}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("累计应收", f"¥{t_amt:,.2f}")
+            c2.metric("已到账", f"¥{t_paid:,.2f}")
+            c3.metric("待收余款", f"¥{t_amt - t_paid:,.2f}")
             
             st.divider()
-            
-            # 项目明细
             for inv in invoices:
-                # 寻找在全局数据库中的位置以便修改
+                # 获取全局索引
                 g_idx = next(i for i, d in enumerate(st.session_state.db) if d['文件名'] == inv['文件名'] and d['销方'] == inv['销方'])
                 is_new = inv['文件名'] in st.session_state.new_batch
                 
-                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
-                with c1:
+                cols = st.columns([3, 2, 2, 1])
+                with cols[0]:
                     tag = '<span class="status-new">NEW</span>' if is_new else ''
                     st.markdown(f"**{inv['项目']}** {tag}", unsafe_allow_html=True)
-                    st.caption(f"📅 {inv['日期']} | 📄 {inv['文件名']}")
+                    st.caption(f"🗓️ 开票日期: {inv['日期']} | 📄 {inv['文件名']}")
                 
-                with c2:
-                    new_val = st.number_input("录入实收", value=float(inv["已收"]), key=f"in_{g_idx}", step=100.0)
+                with cols[1]:
+                    new_val = st.number_input("录入实收", value=float(inv["已收"]), key=f"v_{g_idx}", step=100.0)
                     if new_val != inv["已收"]:
                         st.session_state.db[g_idx]["已收"] = new_val
-                        save_data(st.session_state.db) # 自动保存
+                        save_data(st.session_state.db)
                 
                 bal = inv["金额"] - new_val
-                with c3:
-                    st.markdown(f"<p style='margin-top:30px; color:{'#28a745' if bal<=0 else '#f39c12'}'>{'✅ 已结清' if bal<=0 else f'待收: ¥{bal:,.2f}'}</p>", unsafe_allow_html=True)
+                with cols[2]:
+                    color = "#28a745" if bal <= 0 else "#f39c12"
+                    txt = "✅ 已结清" if bal <= 0 else f"待收: ¥{bal:,.2f}"
+                    st.markdown(f"<p style='margin-top:25px; color:{color}; font-weight:bold;'>{txt}</p>", unsafe_allow_html=True)
                 
-                with c4:
+                with cols[3]:
                     st.write(" ")
                     if st.button("🗑️", key=f"del_{g_idx}"):
                         st.session_state.db.pop(g_idx)
                         save_data(st.session_state.db)
                         st.rerun()
-else:
-    st.info("💡 请在左侧上传并解析发票，数据将自动分类并永久保存。")
